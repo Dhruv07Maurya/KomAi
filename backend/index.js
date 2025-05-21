@@ -5,6 +5,7 @@ import voice from "elevenlabs-node";
 import express from "express";
 import { promises as fs } from "fs";
 import { Groq } from "groq-sdk";
+import path from "path";
 
 // Load environment variables
 dotenv.config();
@@ -21,15 +22,30 @@ const voiceID = process.env.VOICE_ID;
 const app = express();
 app.use(express.json());
 app.use(cors());
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // Knowledge base variables
 let knowledgeBase = "";
 
+// Ensure audio directory exists
+async function ensureAudioDir() {
+  const audioDir = path.join(process.cwd(), "audios");
+  try {
+    await fs.mkdir(audioDir, { recursive: true });
+    console.log("Audio directory confirmed");
+  } catch (error) {
+    console.error("Error creating audio directory:", error);
+  }
+  return audioDir;
+}
+
 // Function to load knowledge base
 async function loadKnowledgeBase() {
   try {
-    knowledgeBase = await fs.readFile("idms_knowledge_base.js", "utf8");
+    knowledgeBase = await fs.readFile(
+      path.join(process.cwd(), "idms_knowledge_base.js"), 
+      "utf8"
+    );
     console.log("Knowledge base loaded successfully");
   } catch (error) {
     console.error("Error loading knowledge base:", error);
@@ -42,56 +58,89 @@ app.get("/", (req, res) => {
 });
 
 app.get("/voices", async (req, res) => {
-  res.send(await voice.getVoices(elevenLabsApiKey));
+  try {
+    const voices = await voice.getVoices(elevenLabsApiKey);
+    res.send(voices);
+  } catch (error) {
+    console.error("Error fetching voices:", error);
+    res.status(500).send({ error: "Failed to fetch voices" });
+  }
 });
 
 const execCommand = (command) => {
   return new Promise((resolve, reject) => {
     exec(command, (error, stdout, stderr) => {
-      if (error) reject(error);
+      if (error) {
+        console.error("Exec error:", error);
+        reject(error);
+      }
       resolve(stdout);
     });
   });
 };
 
-// const lipSyncMessage = async (message) => {
-//   const time = new Date().getTime();
-//   console.log(`Starting conversion for message ${message}`);
-//   await execCommand(
-//     `ffmpeg -y -i audios/message_${message}.mp3 audios/message_${message}.wav`
-//     // -y to overwrite the file
-//   );
-//   console.log(`Conversion done in ${new Date().getTime() - time}ms`);
-//   await execCommand(
-//     `./bin/rhubarb -f json -o audios/message_${message}.json audios/message_${message}.wav -r phonetic`
-//   );
-//   // -r phonetic is faster but less accurate
-//   console.log(`Lip sync done in ${new Date().getTime() - time}ms`);
-// };
+// Default lipsync data to use when files aren't available
+const DEFAULT_LIPSYNC = {
+  metadata: {
+    soundFile: "default.wav",
+    duration: 2.0
+  },
+  mouthCues: [
+    { start: 0.0, end: 0.2, value: "X" },
+    { start: 0.2, end: 0.4, value: "A" },
+    { start: 0.4, end: 0.6, value: "E" },
+    { start: 0.6, end: 0.8, value: "O" },
+    { start: 0.8, end: 1.0, value: "U" },
+    { start: 1.0, end: 1.2, value: "A" },
+    { start: 1.2, end: 1.4, value: "E" },
+    { start: 1.4, end: 1.6, value: "O" },
+    { start: 1.6, end: 1.8, value: "X" },
+    { start: 1.8, end: 2.0, value: "X" }
+  ]
+};
 
 app.post("/chat", async (req, res) => {
+  const audioDir = await ensureAudioDir();
   const userMessage = req.body.message;
+  
   if (!userMessage) {
-    res.send({
-      messages: [
-        {
-          text: "Hey there! How can I help you with IDMS information today?",
-          audio: await audioFileToBase64("audios/intro_0.wav"),
-          lipsync: await readJsonTranscript("audios/intro_0.json"),
-          facialExpression: "smile",
-          animation: "Talking_1",
-        },
-      ],
-    });
-    return;
+    try {
+      const introAudioPath = path.join(audioDir, "intro_0.wav");
+      let audioData = "";
+      let lipsyncData = DEFAULT_LIPSYNC;
+      
+      try {
+        audioData = await audioFileToBase64(introAudioPath);
+        lipsyncData = await readJsonTranscript(path.join(audioDir, "intro_0.json"));
+      } catch (error) {
+        console.log("Using default audio/lipsync for intro");
+      }
+      
+      res.send({
+        messages: [
+          {
+            text: "Hey there! How can I help you with IDMS information today?",
+            audio: audioData,
+            lipsync: lipsyncData,
+            facialExpression: "smile",
+            animation: "Talking_1",
+          },
+        ],
+      });
+      return;
+    } catch (error) {
+      console.error("Error handling empty message:", error);
+    }
   }
+  
   if (!elevenLabsApiKey || !groqApiKey) {
+    console.warn("API keys not properly configured");
     res.send({
       messages: [
         {
           text: "Please ensure your API keys are properly set up!",
-          audio: await audioFileToBase64("audios/api_0.wav"),
-          lipsync: await readJsonTranscript("audios/api_1.json"),
+          audio: "",
+          lipsync: DEFAULT_LIPSYNC,
           facialExpression: "angry",
           animation: "Angry",
         },
@@ -134,27 +183,31 @@ app.post("/chat", async (req, res) => {
 
     // If query isn't related to our domain, return a message indicating the limitation
     if (!isDomainRelevant && knowledgeBase) {
-      const messages = [
-        {
-          text: "I'm Kom Ai specialized in IDMS ERP systems and GST integration. I don't have information on topics outside this domain. Can I help you with any IDMS or GST related questions?",
-          facialExpression: "smile",
-          animation: "Talking_0",
-        },
-      ];
-
-      // Process message for audio
-      for (let i = 0; i < messages.length; i++) {
-        const message = messages[i];
-        const fileName = `audios/message_${i}.mp3`;
+      const messageText = "I'm Kom Ai specialized in IDMS ERP systems and GST integration. I don't have information on topics outside this domain. Can I help you with any IDMS or GST related questions?";
+      
+      let audioData = "";
+      try {
+        const fileName = path.join(audioDir, "message_domain.mp3");
         await voice.textToSpeech(
           elevenLabsApiKey,
           voiceID,
           fileName,
-          message.text
+          messageText
         );
-        message.audio = await audioFileToBase64(fileName);
-        message.lipsync = await readJsonTranscript("audios/api_1.json");
+        audioData = await audioFileToBase64(fileName);
+      } catch (error) {
+        console.error("Error generating audio for domain message:", error);
       }
+
+      const messages = [
+        {
+          text: messageText,
+          facialExpression: "smile",
+          animation: "Talking_0",
+          audio: audioData,
+          lipsync: DEFAULT_LIPSYNC
+        },
+      ];
 
       res.send({ messages });
       return;
@@ -194,6 +247,7 @@ app.post("/chat", async (req, res) => {
 
     // Parse the response as JSON
     let responseContent = completion.choices[0].message.content;
+    console.log("Response from Groq:", responseContent);
     let messages;
 
     try {
@@ -205,6 +259,7 @@ app.post("/chat", async (req, res) => {
         messages = messages.messages;
       }
     } catch (e) {
+      console.error("Error parsing JSON response:", e);
       // If not valid JSON, try to extract JSON from the text
       const jsonMatch = responseContent.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
@@ -214,6 +269,7 @@ app.post("/chat", async (req, res) => {
             messages = messages.messages;
           }
         } catch (innerError) {
+          console.error("Error parsing extracted JSON:", innerError);
           // Fallback to a basic message if JSON parsing fails
           messages = [
             {
@@ -243,16 +299,25 @@ app.post("/chat", async (req, res) => {
     // Process each message to generate audio and lipsync
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
-      // generate audio file
-      const fileName = `audios/message_${i}.mp3`; // The name of your audio file
-      const textInput = message.text; // The text you wish to convert to speech
-      await voice.textToSpeech(elevenLabsApiKey, voiceID, fileName, textInput);
-      // generate lipsync
-      // await lipSyncMessage(i);
-      message.audio = await audioFileToBase64(fileName);
-      message.lipsync = await readJsonTranscript("audios/api_1.json");
+      try {
+        // Generate audio file
+        const fileName = path.join(audioDir, `message_${i}.mp3`);
+        const textInput = message.text;
+        
+        await voice.textToSpeech(elevenLabsApiKey, voiceID, fileName, textInput);
+        console.log(`Audio generated for message ${i}`);
+        
+        message.audio = await audioFileToBase64(fileName);
+        // Use default lipsync data since we can't reliably generate it in the cloud
+        message.lipsync = DEFAULT_LIPSYNC;
+      } catch (error) {
+        console.error(`Error processing message ${i}:`, error);
+        message.audio = "";
+        message.lipsync = DEFAULT_LIPSYNC;
+      }
     }
 
+    console.log("Sending response with messages");
     res.send({ messages });
   } catch (error) {
     console.error("Error with Groq API:", error);
@@ -262,6 +327,8 @@ app.post("/chat", async (req, res) => {
           text: "Sorry, there was an error processing your message with the Groq API.",
           facialExpression: "sad",
           animation: "Idle",
+          audio: "",
+          lipsync: DEFAULT_LIPSYNC
         },
       ],
     });
@@ -275,7 +342,7 @@ const readJsonTranscript = async (file) => {
   } catch (error) {
     console.error(`Error reading JSON file ${file}:`, error);
     // Return a minimal empty lipsync object as fallback
-    return { mouthCues: [] };
+    return DEFAULT_LIPSYNC;
   }
 };
 
@@ -290,8 +357,17 @@ const audioFileToBase64 = async (file) => {
 };
 
 // Load knowledge base and start server
-loadKnowledgeBase().then(() => {
-  app.listen(port, () => {
-    console.log(`IDMS Knowledge Assistant listening on port ${port}`);
-  });
-});
+async function startServer() {
+  try {
+    await loadKnowledgeBase();
+    await ensureAudioDir();
+    
+    app.listen(port, () => {
+      console.log(`IDMS Knowledge Assistant listening on port ${port}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error);
+  }
+}
+
+startServer();
