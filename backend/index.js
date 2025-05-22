@@ -27,6 +27,9 @@ const port = process.env.PORT || 3000;
 // Knowledge base variables
 let knowledgeBase = "";
 
+// Audio generation timeout (10 seconds)
+const AUDIO_TIMEOUT = 10000;
+
 // Ensure audio directory exists
 async function ensureAudioDir() {
   const audioDir = path.join(process.cwd(), "audios");
@@ -53,6 +56,29 @@ async function loadKnowledgeBase() {
   }
 }
 
+// Test ElevenLabs API connection
+async function testElevenLabsConnection() {
+  try {
+    if (!elevenLabsApiKey) {
+      console.error("ElevenLabs API key not found");
+      return false;
+    }
+    
+    const voices = await Promise.race([
+      voice.getVoices(elevenLabsApiKey),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Timeout")), 5000)
+      )
+    ]);
+    
+    console.log("ElevenLabs API connection successful");
+    return true;
+  } catch (error) {
+    console.error("ElevenLabs API connection failed:", error.message);
+    return false;
+  }
+}
+
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
@@ -65,6 +91,25 @@ app.get("/voices", async (req, res) => {
     console.error("Error fetching voices:", error);
     res.status(500).send({ error: "Failed to fetch voices" });
   }
+});
+
+app.get("/health", async (req, res) => {
+  const health = {
+    server: "running",
+    groqApi: !!groqApiKey,
+    elevenLabsApi: !!elevenLabsApiKey,
+    knowledgeBase: !!knowledgeBase,
+    timestamp: new Date().toISOString()
+  };
+  
+  try {
+    const elevenLabsConnected = await testElevenLabsConnection();
+    health.elevenLabsConnected = elevenLabsConnected;
+  } catch (error) {
+    health.elevenLabsConnected = false;
+  }
+  
+  res.json(health);
 });
 
 const execCommand = (command) => {
@@ -99,7 +144,31 @@ const DEFAULT_LIPSYNC = {
   ]
 };
 
+// Enhanced audio generation with better error handling and timeout
+async function generateAudioWithTimeout(apiKey, voiceId, fileName, text) {
+  console.log(`Attempting to generate audio for: "${text.substring(0, 50)}..."`);
+  
+  return new Promise(async (resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      console.error("Audio generation timeout");
+      reject(new Error("Audio generation timeout"));
+    }, AUDIO_TIMEOUT);
+
+    try {
+      await voice.textToSpeech(apiKey, voiceId, fileName, text);
+      clearTimeout(timeoutId);
+      console.log("Audio generation successful");
+      resolve();
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error("Audio generation failed:", error.message);
+      reject(error);
+    }
+  });
+}
+
 app.post("/chat", async (req, res) => {
+  console.log("=== Chat request received ===");
   const audioDir = await ensureAudioDir();
   const userMessage = req.body.message;
   
@@ -135,6 +204,9 @@ app.post("/chat", async (req, res) => {
   
   if (!elevenLabsApiKey || !groqApiKey) {
     console.warn("API keys not properly configured");
+    console.log("ElevenLabs API Key present:", !!elevenLabsApiKey);
+    console.log("Groq API Key present:", !!groqApiKey);
+    
     res.send({
       messages: [
         {
@@ -150,6 +222,8 @@ app.post("/chat", async (req, res) => {
   }
 
   try {
+    console.log("Processing user message:", userMessage);
+    
     // First, use Groq to determine if the query is related to the knowledge base domain
     const domainCheckPrompt = `
     You are a filter that determines if a query is related to the following domain:
@@ -166,6 +240,7 @@ app.post("/chat", async (req, res) => {
     Respond with ONLY "RELEVANT" if the query is related to these topics, or "IRRELEVANT" if it's completely unrelated.
     `;
 
+    console.log("Checking domain relevance...");
     const domainCheck = await groq.chat.completions.create({
       model: "llama3-8b-8192",
       messages: [
@@ -180,6 +255,8 @@ app.post("/chat", async (req, res) => {
 
     const isDomainRelevant =
       domainCheck.choices[0].message.content.includes("RELEVANT");
+    
+    console.log("Domain relevance result:", isDomainRelevant);
 
     // If query isn't related to our domain, return a message indicating the limitation
     if (!isDomainRelevant && knowledgeBase) {
@@ -188,15 +265,20 @@ app.post("/chat", async (req, res) => {
       let audioData = "";
       try {
         const fileName = path.join(audioDir, "message_domain.mp3");
-        await voice.textToSpeech(
+        console.log("Generating audio for domain restriction message...");
+        
+        await generateAudioWithTimeout(
           elevenLabsApiKey,
           voiceID,
           fileName,
           messageText
         );
+        
         audioData = await audioFileToBase64(fileName);
+        console.log("Domain message audio generated successfully");
       } catch (error) {
         console.error("Error generating audio for domain message:", error);
+        audioData = ""; // Ensure it's empty string, not undefined
       }
 
       const messages = [
@@ -209,6 +291,7 @@ app.post("/chat", async (req, res) => {
         },
       ];
 
+      console.log("Sending domain restriction response");
       res.send({ messages });
       return;
     }
@@ -228,6 +311,7 @@ app.post("/chat", async (req, res) => {
     ${knowledgeBase}
     `;
 
+    console.log("Generating response with Groq...");
     // Now use Groq to generate a response based only on the knowledge base
     const completion = await groq.chat.completions.create({
       model: "llama3-8b-8192",
@@ -247,7 +331,7 @@ app.post("/chat", async (req, res) => {
 
     // Parse the response as JSON
     let responseContent = completion.choices[0].message.content;
-    console.log("Response from Groq:", responseContent);
+    console.log("Raw response from Groq:", responseContent);
     let messages;
 
     try {
@@ -296,28 +380,56 @@ app.post("/chat", async (req, res) => {
       messages = [messages];
     }
 
+    console.log(`Processing ${messages.length} messages for audio generation`);
+
     // Process each message to generate audio and lipsync
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
+      console.log(`Processing message ${i}: "${message.text.substring(0, 50)}..."`);
+      
       try {
         // Generate audio file
-        const fileName = path.join(audioDir, `message_${i}.mp3`);
+        const fileName = path.join(audioDir, `message_${i}_${Date.now()}.mp3`);
         const textInput = message.text;
         
-        await voice.textToSpeech(elevenLabsApiKey, voiceID, fileName, textInput);
-        console.log(`Audio generated for message ${i}`);
+        console.log(`Generating audio for message ${i}...`);
+        await generateAudioWithTimeout(
+          elevenLabsApiKey,
+          voiceID,
+          fileName,
+          textInput
+        );
         
+        console.log(`Reading audio file for message ${i}...`);
         message.audio = await audioFileToBase64(fileName);
-        // Use default lipsync data since we can't reliably generate it in the cloud
+        
+        // Clean up the file after converting to base64
+        try {
+          await fs.unlink(fileName);
+          console.log(`Cleaned up audio file: ${fileName}`);
+        } catch (cleanupError) {
+          console.warn(`Could not clean up file ${fileName}:`, cleanupError.message);
+        }
+        
         message.lipsync = DEFAULT_LIPSYNC;
+        console.log(`Message ${i} processed successfully with audio`);
+        
       } catch (error) {
         console.error(`Error processing message ${i}:`, error);
-        message.audio = "";
+        message.audio = ""; // Ensure it's empty string
         message.lipsync = DEFAULT_LIPSYNC;
+        console.log(`Message ${i} processed with fallback (no audio)`);
       }
     }
 
-    console.log("Sending response with messages");
+    console.log("=== Sending final response ===");
+    console.log("Messages with audio status:", messages.map((msg, i) => ({
+      messageIndex: i,
+      hasAudio: !!msg.audio,
+      audioLength: msg.audio ? msg.audio.length : 0,
+      text: msg.text.substring(0, 30) + "..."
+    })));
+    
     res.send({ messages });
   } catch (error) {
     console.error("Error with Groq API:", error);
@@ -348,8 +460,11 @@ const readJsonTranscript = async (file) => {
 
 const audioFileToBase64 = async (file) => {
   try {
+    console.log(`Reading audio file: ${file}`);
     const data = await fs.readFile(file);
-    return data.toString("base64");
+    const base64 = data.toString("base64");
+    console.log(`Audio file converted to base64, length: ${base64.length}`);
+    return base64;
   } catch (error) {
     console.error(`Error reading audio file ${file}:`, error);
     return "";
@@ -359,11 +474,19 @@ const audioFileToBase64 = async (file) => {
 // Load knowledge base and start server
 async function startServer() {
   try {
+    console.log("=== Starting IDMS Knowledge Assistant ===");
+    
     await loadKnowledgeBase();
     await ensureAudioDir();
     
+    // Test ElevenLabs connection
+    const elevenLabsOk = await testElevenLabsConnection();
+    console.log("ElevenLabs API Status:", elevenLabsOk ? "Connected" : "Failed");
+    
     app.listen(port, () => {
-      console.log(`IDMS Knowledge Assistant listening on port ${port}`);
+      console.log(`🚀 IDMS Knowledge Assistant listening on port ${port}`);
+      console.log(`📊 Health check available at: http://localhost:${port}/health`);
+      console.log("=== Server Ready ===");
     });
   } catch (error) {
     console.error("Failed to start server:", error);
